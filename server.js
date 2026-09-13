@@ -1,0 +1,16 @@
+const express=require("express"),http=require("http"),path=require("path"),Database=require("better-sqlite3"),bcrypt=require("bcryptjs"),{Server}=require("socket.io");
+const app=express(),server=http.createServer(app),io=new Server(server),db=new Database("pixels.db");
+const SIZE=200,MAX=30,COOLDOWN=5000,ADMIN=process.env.ADMIN_PASSWORD||"BITTE_AENDERN";
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,password TEXT,color TEXT);
+CREATE TABLE IF NOT EXISTS pixels(x INTEGER,y INTEGER,user_id INTEGER,color TEXT,at INTEGER,PRIMARY KEY(x,y));`);
+const user=id=>db.prepare("SELECT id,username,color FROM users WHERE id=?").get(id);
+app.use(express.json());app.use(express.static(path.join(__dirname,"public")));
+app.post("/api/login",(q,s)=>{let u=db.prepare("SELECT * FROM users WHERE username=?").get(String(q.body.username||"").trim());if(!u||!bcrypt.compareSync(String(q.body.password||""),u.password))return s.status(401).json({error:"Benutzername oder Passwort falsch."});s.json({id:u.id,username:u.username,color:u.color})});
+app.get("/api/state",(q,s)=>s.json({pixels:db.prepare("SELECT x,y,color FROM pixels").all()}));
+app.get("/api/users",(q,s)=>s.json(db.prepare("SELECT id,username,color FROM users ORDER BY id").all()));
+app.post("/api/pixel",(q,s)=>{let u=user(+q.body.userId),x=+q.body.x,y=+q.body.y;if(!u)return s.status(401).json({error:"Nicht angemeldet."});if(!Number.isInteger(x)||x<0||x>=SIZE||!Number.isInteger(y)||y<0||y>=SIZE)return s.status(400).json({error:"Ungültiger Pixel."});let last=db.prepare("SELECT MAX(at) t FROM pixels WHERE user_id=?").get(u.id).t||0,remaining=COOLDOWN-(Date.now()-last);if(remaining>0)return s.status(429).json({error:`Warte noch ${Math.ceil(remaining/1000)} Sekunden.`,remaining});db.prepare(`INSERT INTO pixels VALUES(?,?,?,?,?) ON CONFLICT(x,y) DO UPDATE SET user_id=excluded.user_id,color=excluded.color,at=excluded.at`).run(x,y,u.id,u.color,Date.now());io.emit("pixel",{x,y,color:u.color});s.json({ok:true})});
+function admin(q){return q.headers["x-admin-password"]===ADMIN}
+app.post("/api/admin/users",(q,s)=>{if(!admin(q))return s.status(403).json({error:"Admin-Passwort falsch."});if(db.prepare("SELECT COUNT(*) c FROM users").get().c>=MAX)return s.status(400).json({error:"Maximal 30 Teilnehmer."});let n=String(q.body.username||"").trim(),p=String(q.body.password||""),c=String(q.body.color||"");if(!n||p.length<4||!/^#[0-9a-f]{6}$/i.test(c))return s.status(400).json({error:"Name, Passwort und Farbe prüfen."});try{let r=db.prepare("INSERT INTO users(username,password,color) VALUES(?,?,?)").run(n,bcrypt.hashSync(p,10),c);s.json({id:r.lastInsertRowid,username:n,color:c})}catch(e){s.status(400).json({error:"Name existiert bereits."})}});
+app.delete("/api/admin/users/:id",(q,s)=>{if(!admin(q))return s.status(403).json({error:"Admin-Passwort falsch."});db.prepare("DELETE FROM users WHERE id=?").run(+q.params.id);db.prepare("DELETE FROM pixels WHERE user_id=?").run(+q.params.id);io.emit("reload");s.json({ok:true})});
+app.post("/api/admin/reset",(q,s)=>{if(!admin(q))return s.status(403).json({error:"Admin-Passwort falsch."});db.prepare("DELETE FROM pixels").run();io.emit("reset");s.json({ok:true})});
+server.listen(process.env.PORT||3000,()=>console.log("Pixelgruppe läuft"));
